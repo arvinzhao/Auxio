@@ -16,3 +16,7 @@ captures/
 .kotlin
 .aider*
 .env
+.trae/
+
+# taglib submodule build output
+musikr/src/main/cpp/taglib/pkg/
