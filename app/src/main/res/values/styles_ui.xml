@@ -469,19 +469,31 @@
 
     <style name="Widget.Auxio.Button.Playback.More" parent="Widget.Auxio.Button.Icon.Base" />
 
-    <style name="Widget.Auxio.Button.Playback.Toggle" parent="Widget.Material3Expressive.Button.IconButton.Outlined">
+    <style name="Widget.Auxio.Button.Playback.Toggle" parent="Widget.Material3Expressive.Button.IconButton">
         <item name="android:checkable">true</item>
         <item name="toggleCheckedStateOnClick">false</item>
         <item name="iconTint">@color/sel_checkable_icon</item>
-        <item name="strokeColor">@color/sel_checkable_outline</item>
-        <item name="backgroundTint">?attr/colorSurfaceContainerLow</item>
+        <item name="shapeAppearance">@style/ShapeAppearance.Material3.Corner.Full</item>
     </style>
 
-    <style name="Widget.Auxio.Button.Playback.Skip" parent="Widget.Material3Expressive.Button.IconButton.Tonal" />
+    <style name="Widget.Auxio.Button.Playback.Skip" parent="Widget.Material3Expressive.Button.IconButton">
+        <item name="iconTint">@color/sel_checkable_icon</item>
+        <item name="materialThemeOverlay">@style/ThemeOverlay.Auxio.Button.Playback.Skip</item>
+        <item name="shapeAppearance">@style/ShapeAppearance.Material3.Corner.Full</item>
+    </style>
 
-    <style name="Widget.Auxio.Button.Playback.PlayPause" parent="Widget.Material3Expressive.Button.IconButton.Tonal">
+    <!-- The base expressive icon button is filled with the primary color; use the
+         unselected container colors so that the skip buttons match the repeat and
+         shuffle toggles. -->
+    <style name="ThemeOverlay.Auxio.Button.Playback.Skip" parent="">
+        <item name="colorContainer">?attr/colorSurfaceContainerHighest</item>
+        <item name="colorOnContainer">?attr/colorOnSurfaceVariant</item>
+    </style>
+
+    <style name="Widget.Auxio.Button.Playback.PlayPause" parent="Widget.Material3Expressive.Button.IconButton">
         <item name="android:checkable">true</item>
-        <item name="materialThemeOverlay">@style/ThemeOverlay.Auxio.Button.PrimaryTonal</item>
+        <item name="iconTint">@color/sel_checkable_icon</item>
+        <item name="shapeAppearance">@style/ShapeAppearance.Material3.Corner.Full</item>
     </style>
     <style name="ThemeOverlay.Auxio.Button.PrimaryTonal" parent="">
         <item name="colorContainer">?attr/colorPrimaryContainer</item>

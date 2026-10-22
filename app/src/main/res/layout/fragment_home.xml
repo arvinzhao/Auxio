@@ -42,9 +42,8 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:background="@android:color/transparent"
-            app:tabContentStart="@dimen/spacing_medium"
-            app:tabGravity="start"
-            app:tabMode="scrollable" />
+            app:tabGravity="fill"
+            app:tabMode="fixed" />
 
     </org.oxycblt.auxio.ui.CoordinatorAppBarLayout>
 

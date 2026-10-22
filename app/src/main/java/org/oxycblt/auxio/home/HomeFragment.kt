@@ -22,6 +22,7 @@ import android.annotation.SuppressLint
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.MenuItem
+import android.widget.Toast
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.view.MenuCompat
@@ -31,6 +32,7 @@ import androidx.fragment.app.Fragment
 import androidx.fragment.app.FragmentManager
 import androidx.fragment.app.activityViewModels
 import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.lifecycleScope
 import androidx.navigation.fragment.findNavController
 import androidx.viewpager2.adapter.FragmentStateAdapter
 import androidx.viewpager2.widget.ViewPager2
@@ -38,6 +40,8 @@ import com.google.android.material.appbar.AppBarLayout
 import com.google.android.material.tabs.TabLayoutMediator
 import com.google.android.material.transition.MaterialSharedAxis
 import dagger.hilt.android.AndroidEntryPoint
+import javax.inject.Inject
+import kotlinx.coroutines.launch
 import org.oxycblt.auxio.R
 import org.oxycblt.auxio.databinding.FragmentHomeBinding
 import org.oxycblt.auxio.detail.DetailViewModel
@@ -59,6 +63,7 @@ import org.oxycblt.auxio.music.PlaylistDecision
 import org.oxycblt.auxio.music.PlaylistMessage
 import org.oxycblt.auxio.playback.PlaybackDecision
 import org.oxycblt.auxio.playback.PlaybackViewModel
+import org.oxycblt.auxio.sync.SyncManager
 import org.oxycblt.auxio.ui.FadingToolbarOffsetListener
 import org.oxycblt.auxio.util.collect
 import org.oxycblt.auxio.util.collectImmediately
@@ -84,6 +89,7 @@ class HomeFragment : SelectionFragment<FragmentHomeBinding>() {
     override val playbackModel: PlaybackViewModel by activityViewModels()
     private val homeModel: HomeViewModel by activityViewModels()
     private val detailModel: DetailViewModel by activityViewModels()
+    @Inject lateinit var syncManager: SyncManager
     private var storagePermissionLauncher: ActivityResultLauncher<String>? = null
     private var getContentLauncher: ActivityResultLauncher<String>? = null
     private var pendingImportTarget: Playlist? = null
@@ -191,6 +197,18 @@ class HomeFragment : SelectionFragment<FragmentHomeBinding>() {
             R.id.action_search -> {
                 L.d("Navigating to search")
                 findNavController().navigateSafe(HomeFragmentDirections.search())
+                true
+            }
+            R.id.action_sync_rebroadcast -> {
+                L.d("Rebroadcasting sync service")
+                viewLifecycleOwner.lifecycleScope.launch {
+                    val endpoint = syncManager.rebroadcast()
+                    Toast.makeText(
+                            requireContext(),
+                            getString(R.string.sync_rebroadcast_done, endpoint),
+                            Toast.LENGTH_LONG)
+                        .show()
+                }
                 true
             }
             R.id.action_settings -> {

@@ -102,7 +102,8 @@ class PlaybackPanelFragment :
         // --- UI SETUP ---
         binding.root.setOnApplyWindowInsetsListener { view, insets ->
             val bars = insets.systemBarInsetsCompat
-            view.updatePadding(bottom = bars.bottom)
+            // The panel is fullscreen, so pad for both the status and navigation bars.
+            view.updatePadding(top = bars.top, bottom = bars.bottom)
             insets
         }
 

@@ -173,5 +173,14 @@ private class HomeGeneratorImpl(
         musicRepository.library?.let { listSettings.playlistSort.playlists(it.playlists) }
             ?: emptyList()
 
-    override fun tabs() = homeSettings.homeTabs.filterIsInstance<Tab.Visible>().map { it.type }
+    override fun tabs() =
+        homeSettings.homeTabs
+            .filterIsInstance<Tab.Visible>()
+            .filterNot {
+                // Simplified UI: only songs and playlists tabs are exposed.
+                it.type == MusicType.ALBUMS ||
+                    it.type == MusicType.ARTISTS ||
+                    it.type == MusicType.GENRES
+            }
+            .map { it.type }
 }

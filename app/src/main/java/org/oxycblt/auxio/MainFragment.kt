@@ -64,7 +64,6 @@ import org.oxycblt.auxio.util.collect
 import org.oxycblt.auxio.util.collectImmediately
 import org.oxycblt.auxio.util.context
 import org.oxycblt.auxio.util.coordinatorLayoutBehavior
-import org.oxycblt.auxio.util.getAttrColorCompat
 import org.oxycblt.auxio.util.getDimen
 import org.oxycblt.auxio.util.lazyReflectedMethod
 import org.oxycblt.auxio.util.navigateSafe
@@ -156,30 +155,8 @@ class MainFragment :
             context.getString(R.string.lbl_queue),
         )
 
-        if (queueSheetBehavior != null) {
-            // In portrait mode, set up click listeners on the stacked sheets.
-            L.d("Configuring stacked bottom sheets")
-            unlikelyToBeNull(binding.queueHandleWrapper).setOnClickListener {
-                playbackModel.openQueue()
-            }
-        } else {
-            // Dual-pane mode, manually style the static queue sheet.
-            L.d("Configuring dual-pane bottom sheet")
-            binding.queueSheet.apply {
-                // Emulate the elevated bottom sheet style.
-                background =
-                    MaterialShapeDrawable.createWithElevationOverlay(context).apply {
-                        shapeAppearanceModel =
-                            ShapeAppearanceModel.builder(
-                                    context,
-                                    MR.style.ShapeAppearance_Material3_Corner_ExtraLarge,
-                                    MR.style.ShapeAppearanceOverlay_Material3_Corner_Top,
-                                )
-                                .build()
-                        fillColor = context.getAttrColorCompat(MR.attr.colorSurfaceContainerHigh)
-                    }
-            }
-        }
+        // The queue sheet is hidden as part of the simplified now playing UI; no stacked
+        // sheet listeners or dual-pane styling are needed anymore.
 
         normalCornerSize = playbackSheetBehavior.sheetBackgroundDrawable.topLeftCornerResolvedSize
         maxScaleXDistance =
@@ -189,7 +166,6 @@ class MainFragment :
 
         binding.mainScrim.setOnClickListener { binding.homeNewPlaylistFab.close() }
         binding.sheetScrim.setOnClickListener { binding.homeNewPlaylistFab.close() }
-        binding.homeShuffleFab.setOnClickListener { playbackModel.shuffleAll() }
         binding.homeNewPlaylistFab.apply {
             inflate(R.menu.new_playlist_actions)
             setOnActionSelectedListener(this@MainFragment)
@@ -357,13 +333,6 @@ class MainFragment :
         // Prevent interactions when the playback panel fully fades out.
         binding.playbackPanelFragment.isInvisible = binding.playbackPanelFragment.alpha == 0f
 
-        binding.queueSheet.apply {
-            // Queue sheet (not queue content) should fade out with the playback panel.
-            alpha = playbackInRatio
-            // Prevent interactions when the queue sheet fully fades out.
-            binding.queueSheet.isInvisible = alpha == 0f
-        }
-
         // Prevent interactions when the queue content fully fades out.
         binding.queueFragment.isInvisible = binding.queueFragment.alpha == 0f
 
@@ -379,8 +348,7 @@ class MainFragment :
             .invalidateEnabled()
 
         // Stop the FrameLayout containing the fabs from eating touch events elsewhere
-        binding.mainFabContainer.isVisible =
-            binding.homeNewPlaylistFab.mainFab.isVisible || binding.homeShuffleFab.isVisible
+        binding.mainFabContainer.isVisible = binding.homeNewPlaylistFab.mainFab.isVisible
 
         return true
     }
@@ -448,70 +416,20 @@ class MainFragment :
         tabType: MusicType,
     ) {
         // If there are no songs, it's likely that the library has not been loaded, so
-        // displaying the shuffle FAB makes no sense. We also don't want the fast scroll
+        // displaying the playlist FAB makes no sense. We also don't want the fast scroll
         // popup to overlap with the FAB, so we hide the FAB when fast scrolling too.
         if (shouldHideAllFabs(binding, songs, isFastScrolling)) {
             L.d("Hiding fab: [empty: ${songs.isEmpty()} scrolling: $isFastScrolling]")
             forceHideAllFabs()
-        } else {
-            if (tabType != MusicType.PLAYLISTS) {
-                if (binding.homeShuffleFab.isOrWillBeShown) {
-                    return
-                }
-
-                if (binding.homeNewPlaylistFab.mainFab.isOrWillBeShown) {
-                    L.d("Animating transition")
-                    binding.homeNewPlaylistFab.hide(
-                        object : FloatingActionButton.OnVisibilityChangedListener() {
-                            override fun onHidden(fab: FloatingActionButton) {
-                                super.onHidden(fab)
-                                if (
-                                    shouldHideAllFabs(
-                                        binding,
-                                        homeModel.songList.value,
-                                        homeModel.isFastScrolling.value,
-                                    )
-                                ) {
-                                    return
-                                }
-                                binding.homeShuffleFab.show()
-                            }
-                        }
-                    )
-                } else {
-                    L.d("Showing immediately")
-                    binding.homeShuffleFab.show()
-                }
-            } else {
-                L.d("Showing playlist button")
-                if (binding.homeNewPlaylistFab.mainFab.isOrWillBeShown) {
-                    return
-                }
-
-                if (binding.homeShuffleFab.isOrWillBeShown) {
-                    L.d("Animating transition")
-                    binding.homeShuffleFab.hide(
-                        object : FloatingActionButton.OnVisibilityChangedListener() {
-                            override fun onHidden(fab: FloatingActionButton) {
-                                super.onHidden(fab)
-                                if (
-                                    shouldHideAllFabs(
-                                        binding,
-                                        homeModel.songList.value,
-                                        homeModel.isFastScrolling.value,
-                                    )
-                                ) {
-                                    return
-                                }
-                                binding.homeNewPlaylistFab.show()
-                            }
-                        }
-                    )
-                } else {
-                    L.d("Showing immediately")
-                    binding.homeNewPlaylistFab.show()
-                }
+        } else if (tabType == MusicType.PLAYLISTS) {
+            L.d("Showing playlist button")
+            if (binding.homeNewPlaylistFab.mainFab.isOrWillBeShown) {
+                return
             }
+            binding.homeNewPlaylistFab.show()
+        } else {
+            // Songs tab: no FAB is shown in the simplified UI.
+            forceHideAllFabs()
         }
     }
 
@@ -527,9 +445,6 @@ class MainFragment :
 
     private fun forceHideAllFabs() {
         val binding = requireBinding()
-        if (binding.homeShuffleFab.isOrWillBeShown) {
-            FAB_HIDE_FROM_USER_FIELD.invoke(binding.homeShuffleFab, null, false)
-        }
         if (binding.homeNewPlaylistFab.isOpen) {
             binding.homeNewPlaylistFab.close()
         }
@@ -585,7 +500,8 @@ class MainFragment :
         when (panel) {
             OpenPanel.MAIN -> tryClosePlaybackPanel()
             OpenPanel.PLAYBACK -> tryOpenPlaybackPanel()
-            OpenPanel.QUEUE -> tryOpenQueuePanel()
+            // The queue sheet is hidden in the simplified now playing UI.
+            OpenPanel.QUEUE -> {}
         }
         playbackModel.openPanel.consume()
     }

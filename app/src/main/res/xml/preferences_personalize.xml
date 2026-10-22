@@ -3,22 +3,6 @@
     xmlns:app="http://schemas.android.com/apk/res-auto"
     app:title="@string/set_personalize">
 
-    <PreferenceCategory app:title="@string/set_display">
-
-        <org.oxycblt.auxio.settings.ui.WrappedDialogPreference
-            app:key="@string/set_key_home_tabs"
-            app:summary="@string/set_lib_tabs_desc"
-            app:title="@string/set_lib_tabs" />
-
-        <org.oxycblt.auxio.settings.ui.IntListPreference
-            app:defaultValue="@integer/action_mode_next"
-            app:entries="@array/entries_bar_action"
-            app:entryValues="@array/values_bar_action"
-            app:key="@string/set_key_bar_action"
-            app:title="@string/set_bar_action" />
-
-    </PreferenceCategory>
-
     <PreferenceCategory android:title="@string/set_behavior">
 
         <org.oxycblt.auxio.settings.ui.IntListPreference

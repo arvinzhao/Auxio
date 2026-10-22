@@ -51,15 +51,6 @@
                 app:sdMainFabClosedIconColor="@android:color/white"
                 app:sdMainFabClosedSrc="@drawable/ic_add_24" />
 
-            <com.google.android.material.floatingactionbutton.FloatingActionButton
-                android:id="@+id/home_shuffle_fab"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_margin="@dimen/spacing_medium"
-                android:layout_gravity="bottom|end"
-                android:contentDescription="@string/lbl_shuffle"
-                android:src="@drawable/ic_shuffle_off_24" />
-
         </org.oxycblt.auxio.ui.EdgeFrameLayout>
 
     </org.oxycblt.auxio.ui.EatInsetsFrameLayout>
@@ -100,6 +91,7 @@
             android:elevation="1dp"
             android:focusable="true"
             android:orientation="vertical"
+            android:visibility="gone"
             app:layout_behavior="org.oxycblt.auxio.playback.queue.QueueBottomSheetBehavior">
 
             <androidx.constraintlayout.widget.ConstraintLayout

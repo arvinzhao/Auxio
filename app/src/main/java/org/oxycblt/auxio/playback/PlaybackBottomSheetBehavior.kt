@@ -92,10 +92,9 @@ class PlaybackBottomSheetBehavior<V : View>(context: Context, attributeSet: Attr
 
     override fun applyWindowInsets(child: View, insets: WindowInsets): WindowInsets {
         super.applyWindowInsets(child, insets)
-        // Offset our expanded panel by the size of the playback bar, as that is shown when
-        // we slide up the panel.
+        // The expanded panel covers the entire screen, including the status bar area.
         val bars = insets.systemBarInsetsCompat
-        expandedOffset = bars.top
+        expandedOffset = 0
         return insets.replaceSystemBarInsetsCompat(
             bars.left,
             bars.top,
