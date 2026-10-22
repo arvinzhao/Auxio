@@ -496,4 +496,12 @@
         <item quantity="one">%d second</item>
         <item quantity="other">%d seconds</item>
     </plurals>
+
+    <!-- MusicBox playlist sync pairing -->
+    <string name="sync_pair_title">Device sync request</string>
+    <string name="sync_pair_message">Allow \u0022%1$s\u0022 to sync playlists to this device?</string>
+    <string name="sync_accept">Accept</string>
+    <string name="sync_reject">Reject</string>
+    <string name="sync_rebroadcast">Rebroadcast sync service</string>
+    <string name="sync_rebroadcast_done">Sync service rebroadcasted at %1$s</string>
 </resources>

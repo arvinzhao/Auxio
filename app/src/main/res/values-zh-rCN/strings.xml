@@ -345,4 +345,12 @@
     <string name="set_saf_multithread_desc">更快但在一些设备上失败</string>
     <string name="err_share_too_large">过大无法分享</string>
     <string name="err_share_failed">无法分享这个</string>
+
+    <!-- MusicBox 播放列表同步配对 -->
+    <string name="sync_pair_title">设备同步请求</string>
+    <string name="sync_pair_message">允许“%1$s”同步播放列表到本设备吗？</string>
+    <string name="sync_accept">接受</string>
+    <string name="sync_reject">拒绝</string>
+    <string name="sync_rebroadcast">重新广播同步服务</string>
+    <string name="sync_rebroadcast_done">同步服务已重新广播：%1$s</string>
 </resources>

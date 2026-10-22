@@ -26,11 +26,17 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.view.WindowCompat
 import androidx.core.view.updatePadding
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import dagger.hilt.android.AndroidEntryPoint
 import javax.inject.Inject
+import kotlinx.coroutines.launch
 import org.oxycblt.auxio.databinding.ActivityMainBinding
 import org.oxycblt.auxio.playback.PlaybackViewModel
 import org.oxycblt.auxio.playback.state.DeferredPlayback
+import org.oxycblt.auxio.sync.SyncManager
 import org.oxycblt.auxio.ui.UISettings
 import org.oxycblt.auxio.util.isNight
 import org.oxycblt.auxio.util.systemBarInsetsCompat
@@ -54,6 +60,7 @@ import timber.log.Timber as L
 class MainActivity : AppCompatActivity() {
     private val playbackModel: PlaybackViewModel by viewModels()
     @Inject lateinit var uiSettings: UISettings
+    @Inject lateinit var syncManager: SyncManager
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -62,6 +69,7 @@ class MainActivity : AppCompatActivity() {
         val binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         setupEdgeToEdge(binding.root)
+        setupSyncPairing()
         L.d("Activity created")
     }
 
@@ -107,6 +115,33 @@ class MainActivity : AppCompatActivity() {
             val bars = insets.systemBarInsetsCompat
             view.updatePadding(left = bars.left, right = bars.right)
             insets
+        }
+    }
+
+    /**
+     * Show a confirmation dialog for each pending MusicBox pairing request, so that the user
+     * explicitly allows a PC to synchronize playlists to this device.
+     */
+    private fun setupSyncPairing() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                syncManager.pairRequests.collect { request ->
+                    request ?: return@collect
+                    MaterialAlertDialogBuilder(this@MainActivity)
+                        .setTitle(R.string.sync_pair_title)
+                        .setMessage(getString(R.string.sync_pair_message, request.deviceName))
+                        .setPositiveButton(R.string.sync_accept) { _, _ ->
+                            syncManager.resolve(request, true)
+                        }
+                        .setNegativeButton(R.string.sync_reject) { _, _ ->
+                            syncManager.resolve(request, false)
+                        }
+                        .setOnCancelListener {
+                            syncManager.resolve(request, false)
+                        }
+                        .show()
+                }
+            }
         }
     }
 

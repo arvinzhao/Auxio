@@ -15,6 +15,11 @@
         app:showAsAction="ifRoom" />
 
     <item
+        android:id="@+id/action_sync_rebroadcast"
+        android:title="@string/sync_rebroadcast"
+        app:showAsAction="never" />
+
+    <item
         android:id="@+id/action_settings"
         android:title="@string/set_root_title"
         app:showAsAction="never" />
