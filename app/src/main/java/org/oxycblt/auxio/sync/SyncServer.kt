@@ -25,11 +25,13 @@ import org.json.JSONObject
 import timber.log.Timber as L
 
 /**
- * The embedded HTTP server that MusicBox (PC) pushes playlists to.
+ * The embedded HTTP server that MusicBox (PC) synchronizes playlists with.
  *
- * Implements the endpoints defined by the `localsend-playlist-sync` protocol:
- * `/pair`, `/sync/manifest`, `/sync/file`, `/sync/commit` and `/sync/abort`. All sync
- * endpoints require the Bearer token issued during pairing.
+ * Implements the endpoints defined by the `localsend-playlist-sync` protocol v2, which is
+ * built around a single shared HTML snapshot document (see [PlaylistSnapshot]):
+ * `/sync/snapshot/revision`, `/sync/snapshot/pull`, `/sync/snapshot/push`, `/sync/snapshot/apply`,
+ * `/sync/file` and `/sync/abort`. All sync endpoints require the Bearer token issued during
+ * pairing.
  *
  * Request bodies are read straight off [NanoHTTPD.IHTTPSession.getInputStream] so that large
  * audio uploads can be streamed without temporary files.
@@ -51,8 +53,21 @@ class SyncServer(private val handler: Handler, port: Int = 0) :
             protocol: Int
         ): JSONObject
 
-        /** Handle a sync manifest, returning the set of missing files on this device. */
-        fun onManifest(token: String, body: JSONObject): JSONObject
+        /** Report the revision of the locally stored snapshot (cheap poll endpoint). */
+        fun onSnapshotRevision(token: String): JSONObject
+
+        /** Return the current snapshot document from this device. */
+        fun onSnapshotPull(token: String): JSONObject
+
+        /**
+         * Receive a pushed snapshot document. When [deferImport] is set, the document is only
+         * stored and the response reports which audio files are still missing; otherwise it is
+         * imported immediately.
+         */
+        fun onSnapshotPush(token: String, html: String, deferImport: Boolean): JSONObject
+
+        /** Import the previously stored pending snapshot into the local library. */
+        fun onSnapshotApply(token: String): JSONObject
 
         /**
          * Receive a pushed file (audio or cover) streamed from [input].
@@ -67,9 +82,6 @@ class SyncServer(private val handler: Handler, port: Int = 0) :
             contentLength: Long,
             input: InputStream,
         ): JSONObject
-
-        /** Commit the synchronized playlist into the local music library. */
-        fun onCommit(token: String, body: JSONObject): JSONObject
 
         /** Abort any ongoing synchronization session. */
         fun onAbort(token: String, body: JSONObject): JSONObject
@@ -86,15 +98,27 @@ class SyncServer(private val handler: Handler, port: Int = 0) :
             } else {
                 when (path) {
                     "/pair" -> jsonResponse(Response.Status.OK, handlePair(session))
-                    "/sync/manifest" ->
+                    "/sync/snapshot/revision" ->
                         authed(session) {
-                            jsonResponse(Response.Status.OK, handler.onManifest(it, readJson(session)))
+                            jsonResponse(Response.Status.OK, handler.onSnapshotRevision(it))
+                        }
+                    "/sync/snapshot/pull" ->
+                        authed(session) {
+                            jsonResponse(Response.Status.OK, handler.onSnapshotPull(it))
+                        }
+                    "/sync/snapshot/push" -> {
+                        val (token, body) = authedWithBody(session)
+                        val html =
+                            body.optString("html").takeIf { it.isNotEmpty() }
+                                ?: fail(Response.Status.BAD_REQUEST, "missing_html")
+                        val deferImport = body.optBoolean("deferImport", false)
+                        jsonResponse(Response.Status.OK, handler.onSnapshotPush(token, html, deferImport))
+                    }
+                    "/sync/snapshot/apply" ->
+                        authed(session) {
+                            jsonResponse(Response.Status.OK, handler.onSnapshotApply(it))
                         }
                     "/sync/file" -> jsonResponse(Response.Status.OK, handleFile(session))
-                    "/sync/commit" ->
-                        authed(session) {
-                            jsonResponse(Response.Status.OK, handler.onCommit(it, readJson(session)))
-                        }
                     "/sync/abort" ->
                         authed(session) {
                             jsonResponse(Response.Status.OK, handler.onAbort(it, readJson(session)))
@@ -142,6 +166,12 @@ class SyncServer(private val handler: Handler, port: Int = 0) :
     private fun authed(session: IHTTPSession, block: (String) -> Response): Response =
         block(requireToken(session))
 
+    /** Authenticate and read the JSON body in one step (for endpoints that need both). */
+    private fun authedWithBody(session: IHTTPSession): Pair<String, JSONObject> {
+        val token = requireToken(session)
+        return token to readJson(session)
+    }
+
     private fun requireToken(session: IHTTPSession): String {
         val authorization =
             session.headers["authorization"] ?: fail(Response.Status.UNAUTHORIZED, "unauthorized")
@@ -188,6 +218,8 @@ class SyncServer(private val handler: Handler, port: Int = 0) :
     private companion object {
         private const val HEADER_FILE_ID = "x-file-id"
         private const val HEADER_FILE_NAME = "x-file-name"
-        private const val MAX_JSON_BYTES = 8 * 1024 * 1024
+        // Snapshot documents embed every playlist and track of the whole library, so the
+        // JSON body limit has to accommodate large libraries.
+        private const val MAX_JSON_BYTES = 64 * 1024 * 1024
     }
 }

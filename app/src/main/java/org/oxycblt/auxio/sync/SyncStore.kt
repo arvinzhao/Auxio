@@ -20,17 +20,21 @@ package org.oxycblt.auxio.sync
 
 import android.content.Context
 import android.content.SharedPreferences
+import java.io.File
 import java.util.UUID
 import org.json.JSONObject
 
 /**
  * Persistent storage backing the MusicBox playlist sync feature.
  *
- * Stores this device's identity, paired device tokens, received file locations and the last
- * known names of synchronized playlists. Everything is serialized into a single
- * [SharedPreferences] using [JSONObject], as the data volume is tiny.
+ * Stores this device's identity, paired device tokens, received file locations, the shared
+ * playlist snapshot document and the mapping between cross-device playlist IDs and local
+ * playlist UIDs. Small values are serialized into a single [SharedPreferences] using
+ * [JSONObject]; the (potentially large) HTML snapshot documents live in the app's external
+ * files directory.
  */
 class SyncStore(context: Context) {
+    private val context: Context = context.applicationContext
     private val prefs: SharedPreferences =
         context.getSharedPreferences("sync", Context.MODE_PRIVATE)
 
@@ -102,6 +106,146 @@ class SyncStore(context: Context) {
         prefs.edit().putString(KEY_PLAYLISTS, obj.toString()).apply()
     }
 
+    // --- Playlist identity mapping ---
+
+    /**
+     * The cross-device playlist ID bound to the given local playlist [uid] string, creating
+     * and persisting a fresh binding if none exists yet.
+     */
+    fun playlistIdForUid(uid: String): String {
+        val obj = JSONObject(prefs.getString(KEY_PLAYLIST_IDS, null) ?: "{}")
+        return obj.optString(uid).takeIf { it.isNotEmpty() }
+            ?: UUID.randomUUID().toString().also {
+                obj.put(uid, it)
+                prefs.edit().putString(KEY_PLAYLIST_IDS, obj.toString()).apply()
+            }
+    }
+
+    /** The local playlist UID string bound to the given [playlistId], or null. */
+    fun uidForPlaylistId(playlistId: String): String? {
+        val obj = JSONObject(prefs.getString(KEY_PLAYLIST_BINDINGS, null) ?: "{}")
+        return obj.optString(playlistId).takeIf { it.isNotEmpty() }
+    }
+
+    /** Bind a cross-device [playlistId] to a local playlist [uid] string. */
+    fun bindPlaylist(playlistId: String, uid: String) {
+        val bindings = JSONObject(prefs.getString(KEY_PLAYLIST_BINDINGS, null) ?: "{}")
+        bindings.put(playlistId, uid)
+        prefs.edit().putString(KEY_PLAYLIST_BINDINGS, bindings.toString()).apply()
+        // Maintain the reverse map as well.
+        val ids = JSONObject(prefs.getString(KEY_PLAYLIST_IDS, null) ?: "{}")
+        if (ids.optString(uid) != playlistId) {
+            ids.put(uid, playlistId)
+            prefs.edit().putString(KEY_PLAYLIST_IDS, ids.toString()).apply()
+        }
+    }
+
+    /** Drop the binding for the given [playlistId] (e.g. the playlist was deleted). */
+    fun unbindPlaylistId(playlistId: String) {
+        val bindings = JSONObject(prefs.getString(KEY_PLAYLIST_BINDINGS, null) ?: "{}")
+        val uid = bindings.optString(playlistId).takeIf { it.isNotEmpty() }
+        bindings.remove(playlistId)
+        prefs.edit().putString(KEY_PLAYLIST_BINDINGS, bindings.toString()).apply()
+        if (uid != null) {
+            val ids = JSONObject(prefs.getString(KEY_PLAYLIST_IDS, null) ?: "{}")
+            ids.remove(uid)
+            prefs.edit().putString(KEY_PLAYLIST_IDS, ids.toString()).apply()
+        }
+    }
+
+    /** All playlistId → local UID string bindings currently known. */
+    fun allPlaylistBindings(): Map<String, String> {
+        val obj = JSONObject(prefs.getString(KEY_PLAYLIST_BINDINGS, null) ?: "{}")
+        val out = mutableMapOf<String, String>()
+        for (key in obj.keys()) {
+            out[key] = obj.optString(key)
+        }
+        return out
+    }
+
+    /** All fileId → [FileRecord] mappings currently known. */
+    fun allFileRecords(): List<FileRecord> {
+        val obj = files()
+        val out = ArrayList<FileRecord>(obj.length())
+        for (key in obj.keys()) {
+            val record = obj.optJSONObject(key) ?: continue
+            out.add(
+                FileRecord(
+                    fileId = key,
+                    uri = record.optString(KEY_URI),
+                    relPath = record.optString(KEY_REL_PATH),
+                    name = record.optString(KEY_NAME),
+                    size = record.optLong(KEY_SIZE),
+                ))
+        }
+        return out
+    }
+
+    // --- Shared playlist snapshot document ---
+
+    /** The revision of the current snapshot document, or 0 if there is none. */
+    var snapshotRevision: Long
+        get() = prefs.getLong(KEY_SNAPSHOT_REVISION, 0)
+        private set(value) {
+            prefs.edit().putLong(KEY_SNAPSHOT_REVISION, value).apply()
+        }
+
+    /** The name of the device that produced the current snapshot. */
+    var snapshotUpdatedBy: String
+        get() = prefs.getString(KEY_SNAPSHOT_UPDATED_BY, null) ?: "unknown"
+        private set(value) {
+            prefs.edit().putString(KEY_SNAPSHOT_UPDATED_BY, value).apply()
+        }
+
+    /** The current shared snapshot HTML document, or null if none was received/generated. */
+    fun readSnapshot(): String? = readSnapshotFile(SNAPSHOT_FILE)
+
+    /**
+     * Persist the given [html] as the current snapshot document, recording its [revision] and
+     * the producing device's [updatedBy] name.
+     */
+    fun writeSnapshot(html: String, revision: Long, updatedBy: String) {
+        writeSnapshotFile(SNAPSHOT_FILE, html)
+        snapshotRevision = revision
+        snapshotUpdatedBy = updatedBy
+        clearPendingSnapshot()
+    }
+
+    /**
+     * Store an incoming snapshot that still awaits audio file transfer before it can be
+     * imported ("pending"); it replaces the current snapshot only after being applied.
+     */
+    fun writePendingSnapshot(html: String) {
+        writeSnapshotFile(SNAPSHOT_PENDING_FILE, html)
+    }
+
+    /** The pending snapshot HTML, or null if there is nothing awaiting import. */
+    fun readPendingSnapshot(): String? = readSnapshotFile(SNAPSHOT_PENDING_FILE)
+
+    /** Discard any pending (not yet applied) snapshot. */
+    fun clearPendingSnapshot() {
+        snapshotFile(SNAPSHOT_PENDING_FILE).delete()
+    }
+
+    private fun snapshotFile(name: String): File =
+        File(context.getExternalFilesDir(null), name)
+
+    private fun readSnapshotFile(name: String): String? =
+        try {
+            val file = snapshotFile(name)
+            if (file.isFile) file.readText() else null
+        } catch (e: Exception) {
+            null
+        }
+
+    private fun writeSnapshotFile(name: String, html: String) {
+        try {
+            snapshotFile(name).writeText(html)
+        } catch (e: Exception) {
+            // Storage failures leave the previous document in place; the next sync retries.
+        }
+    }
+
     private fun tokens() = JSONObject(prefs.getString(KEY_TOKENS, null) ?: "{}")
 
     private fun files() = JSONObject(prefs.getString(KEY_FILES, null) ?: "{}")
@@ -124,9 +268,15 @@ class SyncStore(context: Context) {
         const val KEY_TOKENS = "tokens"
         const val KEY_FILES = "files"
         const val KEY_PLAYLISTS = "playlists"
+        const val KEY_PLAYLIST_IDS = "playlistIdsByUid"
+        const val KEY_PLAYLIST_BINDINGS = "uidsByPlaylistId"
+        const val KEY_SNAPSHOT_REVISION = "snapshotRevision"
+        const val KEY_SNAPSHOT_UPDATED_BY = "snapshotUpdatedBy"
         const val KEY_URI = "uri"
         const val KEY_REL_PATH = "relPath"
         const val KEY_NAME = "name"
         const val KEY_SIZE = "size"
+        const val SNAPSHOT_FILE = "musicbox-playlists.html"
+        const val SNAPSHOT_PENDING_FILE = "musicbox-playlists.pending.html"
     }
 }

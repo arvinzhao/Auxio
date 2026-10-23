@@ -36,27 +36,36 @@ import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import org.oxycblt.auxio.BuildConfig
+import org.oxycblt.auxio.R
 import org.oxycblt.auxio.music.MusicRepository
+import org.oxycblt.auxio.music.resolve
+import org.oxycblt.musikr.Library
+import org.oxycblt.musikr.Music
 import org.oxycblt.musikr.Song
-import org.oxycblt.musikr.fs.Components
 import timber.log.Timber as L
 
 /**
  * Coordinates the MusicBox (PC) playlist synchronization feature.
  *
- * Owns the embedded [SyncServer] and the mDNS registration, and implements the incremental
- * sync logic: the PC sends a playlist manifest, this device computes which files are missing,
- * receives them over HTTP, and finally writes the playlist into the local music library.
+ * Owns the embedded [SyncServer] and the mDNS registration. Sync protocol v2 is built around a
+ * single shared HTML snapshot document ([PlaylistSnapshot]) that both devices maintain a copy
+ * of: it contains every playlist and song entry, and the copy with the highest revision wins.
+ * This device regenerates its copy whenever the user edits a playlist, accepts pushed copies
+ * from the PC, and serves its copy for the PC to pull. Audio files for tracks missing on this
+ * device are still pushed incrementally by the PC before the pushed snapshot is applied.
  *
  * Pairing requests are surfaced through [pairRequests] for confirmation by an activity.
  */
@@ -64,13 +73,20 @@ import timber.log.Timber as L
 class SyncManager
 @Inject
 constructor(@ApplicationContext private val context: Context, private val repository: MusicRepository) :
-    SyncServer.Handler {
+    SyncServer.Handler, MusicRepository.UpdateListener {
     private val store: SyncStore by lazy { SyncStore(context) }
     private var server: SyncServer? = null
     private var registrationListener: NsdManager.RegistrationListener? = null
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    /** The playlist currently being synchronized, as set by the last manifest. */
-    @Volatile private var sessionPlaylistId: String? = null
+    /** Serializes snapshot regeneration and import so they never interleave. */
+    private val snapshotLock = Any()
+
+    /** True while a pushed snapshot is being imported; suppresses snapshot regeneration. */
+    @Volatile private var importing = false
+
+    /** In-memory cache of the current snapshot, avoiding repeated HTML parsing. */
+    @Volatile private var cachedSnapshot: PlaylistSnapshot? = null
 
     private val _pairRequests = MutableStateFlow<PairRequest?>(null)
 
@@ -101,6 +117,8 @@ constructor(@ApplicationContext private val context: Context, private val reposi
         if (server != null) {
             return
         }
+        // Listen for playlist edits so the shared snapshot document stays current.
+        repository.addUpdateListener(this)
         val instance = SyncServer(this)
         try {
             instance.start(SOCKET_TIMEOUT_MS, true)
@@ -188,6 +206,16 @@ constructor(@ApplicationContext private val context: Context, private val reposi
             ?.hostAddress
             ?: "unknown"
 
+    // --- MusicRepository.UpdateListener ---
+
+    override fun onMusicChanges(changes: MusicRepository.Changes) {
+        if (!changes.userLibrary || importing) {
+            return
+        }
+        // Playlist edits (create/rename/delete/add/rewrite) invalidate the shared snapshot.
+        scope.launch { regenerateSnapshot() }
+    }
+
     // --- SyncServer.Handler ---
 
     override fun onPair(
@@ -222,54 +250,85 @@ constructor(@ApplicationContext private val context: Context, private val reposi
         return JSONObject().put("token", token).put("deviceName", store.deviceName)
     }
 
-    override fun onManifest(token: String, body: JSONObject): JSONObject {
-        val playlist =
-            body.optJSONObject("playlist")
-                ?: throw SyncServer.SyncException(
-                    NanoHTTPD.Response.Status.BAD_REQUEST, "missing_playlist")
-        val playlistId =
-            playlist.optString("playlistId").takeIf { it.isNotEmpty() }
-                ?: throw SyncServer.SyncException(
-                    NanoHTTPD.Response.Status.BAD_REQUEST, "missing_playlist_id")
-        val name = playlist.optString("name").takeIf { it.isNotEmpty() } ?: "MusicBox"
-        val tracks = playlist.optJSONArray("tracks") ?: JSONArray()
-
-        store.putPlaylistName(playlistId, name)
-        sessionPlaylistId = playlistId
-
-        // If the library has not been loaded yet (e.g. the app was just started), kick off a
-        // load so that the incremental comparison and the later commit have something to
-        // match against. Never cancel an indexing run that is already in progress.
-        if (repository.library == null && repository.indexingState == null) {
-            repository.requestIndex(true)
-        }
-
-        // Incremental comparison happens here: anything the library does not currently index
-        // has to be pushed again by the PC.
-        val knownPaths = HashSet<String>()
-        repository.library?.let { library ->
-            for (song in library.songs) {
-                knownPaths.add(song.path.components.unixString)
-            }
-        }
-        val missingFileIds = JSONArray()
-        for (i in 0 until tracks.length()) {
-            val track = tracks.optJSONObject(i) ?: continue
-            val fileId = track.optString("fileId")
-            if (fileId.isEmpty()) {
-                continue
-            }
-            val record = store.findFileRecord(fileId)
-            if (record == null || record.relPath !in knownPaths) {
-                missingFileIds.put(fileId)
-            }
-        }
-        // Covers are received but discarded in v1; embedded tag art is used instead.
+    override fun onSnapshotRevision(token: String): JSONObject {
+        val snapshot = currentSnapshot()
         return JSONObject()
-            .put("missingFileIds", missingFileIds)
-            .put("missingCoverHashes", JSONArray())
-            .put("removedTrackIds", JSONArray())
+            .put("revision", snapshot?.revision ?: 0)
+            .put("updatedBy", snapshot?.updatedBy ?: "unknown")
+            .put("playlistCount", snapshot?.playlists?.size ?: 0)
+            .put("trackCount", snapshot?.trackCount ?: 0)
     }
+
+    override fun onSnapshotPull(token: String): JSONObject {
+        val snapshot =
+            currentSnapshot()
+                ?: throw SyncServer.SyncException(
+                    NanoHTTPD.Response.Status.CONFLICT, "no_snapshot")
+        return JSONObject()
+            .put("revision", snapshot.revision)
+            .put("updatedBy", snapshot.updatedBy)
+            .put("html", snapshot.encode())
+    }
+
+    override fun onSnapshotPush(token: String, html: String, deferImport: Boolean): JSONObject {
+        val incoming =
+            PlaylistSnapshot.decode(html)
+                ?: throw SyncServer.SyncException(
+                    NanoHTTPD.Response.Status.BAD_REQUEST, "invalid_snapshot")
+        if (incoming.revision < store.snapshotRevision) {
+            // The local document is newer than what the PC is pushing; it should pull instead.
+            throw SyncServer.SyncException(
+                NanoHTTPD.Response.Status.CONFLICT, "stale_snapshot")
+        }
+
+        synchronized(snapshotLock) {
+            store.writePendingSnapshot(html)
+
+            // If the library has not been loaded yet (e.g. the app was just started), kick off a
+            // load so that the diff and the later apply have something to match against. Never
+            // cancel an indexing run that is already in progress.
+            if (repository.library == null && repository.indexingState == null) {
+                repository.requestIndex(true)
+            }
+
+            // Incremental comparison happens here: anything the library does not currently
+            // index has to be pushed again by the PC. Without a loaded library the received
+            // file records are trusted instead of re-pushing everything.
+            val library = repository.library
+            val knownPaths = HashSet<String>()
+            if (library != null) {
+                for (song in library.songs) {
+                    knownPaths.add(song.path.components.unixString)
+                }
+            }
+            val missingFileIds = JSONArray()
+            for (playlist in incoming.playlists) {
+                for (track in playlist.tracks) {
+                    val fileId = track.fileId
+                    if (fileId.isEmpty() || fileId.startsWith(LOCAL_FILE_ID_PREFIX)) {
+                        continue
+                    }
+                    val record = store.findFileRecord(fileId)
+                    if (record == null || (library != null && record.relPath !in knownPaths)) {
+                        missingFileIds.put(fileId)
+                    }
+                }
+            }
+
+            val applied = !deferImport
+            if (applied) {
+                applyPendingSnapshot()
+            }
+            L.i(
+                "Accepted pushed snapshot rev ${incoming.revision} " +
+                    "(deferred=$deferImport, missing=${missingFileIds.length()})")
+            return JSONObject()
+                .put("missingFileIds", missingFileIds)
+                .put("applied", applied)
+        }
+    }
+
+    override fun onSnapshotApply(token: String): JSONObject = applyPendingSnapshot()
 
     override fun onFile(
         token: String,
@@ -280,16 +339,14 @@ constructor(@ApplicationContext private val context: Context, private val reposi
         input: InputStream,
     ): JSONObject {
         if (fileId.startsWith("cover:")) {
-            // v1: covers are not persisted, but the payload still has to be drained.
+            // Covers are not persisted; the payload still has to be drained.
             input.readBytes()
             return JSONObject().put("received", true)
         }
-        val playlistName =
-            sessionPlaylistId?.let { store.findPlaylistName(it) } ?: "MusicBox"
         val name = sanitizeName(fileName ?: "track-$fileId")
         val mime = normalizeAudioMime(mimeType, name)
         val record = store.findFileRecord(fileId)
-        val (uri, relPath) = writeAudioFile(record, name, mime, playlistName, contentLength, input)
+        val (uri, relPath) = writeAudioFile(record, name, mime, contentLength, input)
         store.putFileRecord(
             SyncStore.FileRecord(
                 fileId = fileId,
@@ -301,51 +358,194 @@ constructor(@ApplicationContext private val context: Context, private val reposi
         return JSONObject().put("received", true)
     }
 
-    override fun onCommit(token: String, body: JSONObject): JSONObject {
-        val playlistId =
-            body.optString("playlistId").takeIf { it.isNotEmpty() }
-                ?: throw SyncServer.SyncException(
-                    NanoHTTPD.Response.Status.BAD_REQUEST, "missing_playlist_id")
-        val name =
-            store.findPlaylistName(playlistId)
-                ?: throw SyncServer.SyncException(
-                    NanoHTTPD.Response.Status.BAD_REQUEST, "unknown_playlist")
-        val finalTrackIds = body.optJSONArray("finalTrackIds") ?: JSONArray()
-
-        val songs = runBlocking { resolveSongs(finalTrackIds) }
-        // resolveSongs triggers indexing as needed; wait until the library is actually loaded
-        // before mutating playlists (the indexing may take a while on large libraries).
-        val library =
-            runBlocking { awaitLibrary() }
-                ?: throw SyncServer.SyncException(
-                    NanoHTTPD.Response.Status.CONFLICT, "library_not_ready")
-
-        val result = JSONObject()
-        runBlocking {
-            val existing = library.findPlaylistByName(name)
-            if (existing != null) {
-                repository.rewritePlaylist(existing, songs)
-                result
-                    .put("added", 0)
-                    .put("updated", songs.size)
-                    .put("removed", (existing.songs.size - songs.size).coerceAtLeast(0))
-            } else {
-                repository.createPlaylist(name, songs)
-                result.put("added", songs.size).put("updated", 0).put("removed", 0)
-            }
-        }
-        sessionPlaylistId = null
-        L.i("Committed playlist '$name': $result")
-        return result
-    }
-
     override fun onAbort(token: String, body: JSONObject): JSONObject {
-        sessionPlaylistId = null
+        store.clearPendingSnapshot()
         L.i("Sync session aborted")
         return JSONObject().put("aborted", true)
     }
 
     override fun isTokenValid(token: String): Boolean = store.allTokens().containsValue(token)
+
+    // --- Snapshot management ---
+
+    /** The current snapshot, lazily loading (and caching) the stored HTML document. */
+    private fun currentSnapshot(): PlaylistSnapshot? {
+        cachedSnapshot?.let { return it }
+        val html = store.readSnapshot() ?: return null
+        return PlaylistSnapshot.decode(html)?.also { cachedSnapshot = it }
+    }
+
+    /**
+     * Regenerate the shared snapshot document from the current library state, bumping the
+     * revision only when the playlist data actually changed. Runs on library changes that were
+     * caused by the user rather than by a sync import.
+     */
+    private suspend fun regenerateSnapshot() {
+        val library = repository.library ?: return
+        synchronized(snapshotLock) {
+            if (importing) {
+                return
+            }
+            val playlists = buildSnapshotPlaylists(library)
+            val current = currentSnapshot()
+            if (current != null && samePlaylistData(current.playlists, playlists)) {
+                return
+            }
+            val snapshot =
+                PlaylistSnapshot(System.currentTimeMillis(), store.deviceName, playlists)
+            store.writeSnapshot(snapshot.encode(), snapshot.revision, snapshot.updatedBy)
+            cachedSnapshot = snapshot
+            L.i(
+                "Regenerated snapshot rev ${snapshot.revision}: " +
+                    "${playlists.size} playlists, ${snapshot.trackCount} tracks")
+        }
+    }
+
+    /**
+     * Import the previously stored pending snapshot into the local music library, creating,
+     * renaming, rewriting and deleting playlists so that they mirror the shared document.
+     */
+    private fun applyPendingSnapshot(): JSONObject =
+        // runBlocking keeps the server thread synchronous while the monitor is held for the
+        // whole import; suspend calls live inside the runBlocking lambda, not the critical
+        // section itself.
+        synchronized(snapshotLock) { runBlocking { applyPendingSnapshotInternal() } }
+
+    private suspend fun applyPendingSnapshotInternal(): JSONObject {
+        val empty =
+            JSONObject()
+                .put("added", 0)
+                .put("updated", 0)
+                .put("removed", 0)
+                .put("skipped", 0)
+        val pendingHtml = store.readPendingSnapshot() ?: return empty
+        val snapshot =
+            PlaylistSnapshot.decode(pendingHtml)
+                ?: run {
+                    store.clearPendingSnapshot()
+                    throw SyncServer.SyncException(
+                        NanoHTTPD.Response.Status.BAD_REQUEST, "invalid_snapshot")
+                }
+        // resolveSongs triggers indexing as needed; wait until the library is actually loaded
+        // before mutating playlists (the indexing may take a while on large libraries).
+        awaitLibrary()
+            ?: throw SyncServer.SyncException(
+                NanoHTTPD.Response.Status.CONFLICT, "library_not_ready")
+
+        importing = true
+        try {
+            var added = 0
+            var updated = 0
+            var removed = 0
+            var skipped = 0
+            val seenIds = HashSet<String>()
+            for (playlist in snapshot.playlists) {
+                seenIds.add(playlist.playlistId)
+                val fileIds = playlist.tracks.map { it.fileId }.filter { it.isNotEmpty() }
+                val songs = resolveSongs(fileIds)
+                skipped += fileIds.size - songs.size
+                val existing =
+                    findBoundPlaylist(playlist.playlistId)
+                        ?: repository.library?.findPlaylistByName(playlist.name)
+                if (existing != null) {
+                    if (existing.name.raw != playlist.name) {
+                        repository.renamePlaylist(existing, playlist.name)
+                    }
+                    repository.rewritePlaylist(existing, songs)
+                    store.bindPlaylist(playlist.playlistId, existing.uid.toString())
+                    updated++
+                } else {
+                    repository.createPlaylist(playlist.name, songs)
+                    val created = repository.library?.findPlaylistByName(playlist.name)
+                    if (created != null) {
+                        store.bindPlaylist(playlist.playlistId, created.uid.toString())
+                    }
+                    added++
+                }
+            }
+            // Playlists previously shared but no longer present in the document were deleted
+            // on the other device; mirror the deletion locally.
+            for ((playlistId, uidString) in store.allPlaylistBindings()) {
+                if (playlistId in seenIds) {
+                    continue
+                }
+                val uid = Music.UID.fromString(uidString)
+                val playlist = uid?.let { repository.library?.findPlaylist(it) }
+                if (playlist != null) {
+                    repository.deletePlaylist(playlist)
+                    removed++
+                }
+                store.unbindPlaylistId(playlistId)
+            }
+            // The imported document is now the local source of truth.
+            store.writeSnapshot(pendingHtml, snapshot.revision, snapshot.updatedBy)
+            cachedSnapshot = snapshot
+            L.i(
+                "Applied snapshot rev ${snapshot.revision}: added=$added updated=$updated " +
+                    "removed=$removed skipped=$skipped")
+            return JSONObject()
+                .put("added", added)
+                .put("updated", updated)
+                .put("removed", removed)
+                .put("skipped", skipped)
+        } finally {
+            importing = false
+        }
+    }
+
+    /** Find the local [org.oxycblt.musikr.Playlist] bound to the given cross-device ID. */
+    private fun findBoundPlaylist(playlistId: String): org.oxycblt.musikr.Playlist? {
+        val uidString = store.uidForPlaylistId(playlistId) ?: return null
+        val uid = Music.UID.fromString(uidString) ?: return null
+        return repository.library?.findPlaylist(uid)
+    }
+
+    /**
+     * Build snapshot playlists from the library. Every playlist is assigned a stable
+     * cross-device ID (created on first use); songs received from the PC map back to their
+     * original file IDs, while local songs use `local:<uid>` identities.
+     */
+    private fun buildSnapshotPlaylists(library: Library): List<SnapshotPlaylist> {
+        val fileIdByPath = HashMap<String, String>()
+        for (record in store.allFileRecords()) {
+            fileIdByPath[record.relPath] = record.fileId
+        }
+        return library.playlists.map { playlist ->
+            val playlistId = store.playlistIdForUid(playlist.uid.toString())
+            val tracks =
+                playlist.songs.map { song ->
+                    val path = song.path.components.unixString
+                    SnapshotTrack(
+                        fileId = fileIdByPath[path] ?: "$LOCAL_FILE_ID_PREFIX${song.uid}",
+                        title = song.name.raw,
+                        artist =
+                            song.artists.firstOrNull()?.name?.resolve(context)
+                                ?: context.getString(R.string.def_artist),
+                        album = song.album.name.resolve(context),
+                        durationSec = song.durationMs / 1000,
+                        fileSize = song.size,
+                        fileName = path.substringAfterLast('/'),
+                    )
+                }
+            SnapshotPlaylist(playlistId, playlist.name.raw, System.currentTimeMillis(), tracks)
+        }
+    }
+
+    /** Whether two snapshot playlist lists describe the same data (ignoring timestamps). */
+    private fun samePlaylistData(
+        a: List<SnapshotPlaylist>,
+        b: List<SnapshotPlaylist>,
+    ): Boolean {
+        if (a.size != b.size) {
+            return false
+        }
+        return a.zip(b).all { (left, right) ->
+            left.playlistId == right.playlistId &&
+                left.name == right.name &&
+                left.tracks.size == right.tracks.size &&
+                left.tracks.zip(right.tracks).all { (l, r) -> l.fileId == r.fileId }
+        }
+    }
 
     // --- Internals ---
 
@@ -353,46 +553,30 @@ constructor(@ApplicationContext private val context: Context, private val reposi
      * Resolve the given file IDs to [Song]s in order, triggering a re-index and waiting for it
      * if some received files are not in the library yet.
      *
-     * The PC may commit with the full final track list while only pushing the missing files, so
-     * IDs without a received file record are skipped instead of failing the whole commit. The
-     * commit only fails when nothing at all could be resolved.
+     * IDs without a received file record (or whose file no longer resolves) are skipped instead
+     * of failing the whole import; the import only fails when nothing at all could be resolved.
      */
-    private suspend fun resolveSongs(trackIds: JSONArray): List<Song> {
-        val ordered = ArrayList<String>(trackIds.length())
-        for (i in 0 until trackIds.length()) {
-            val id = trackIds.optString(i)
-            if (id.isNotEmpty()) {
-                ordered.add(id)
-            }
-        }
-        var matched = resolve(ordered)
+    private suspend fun resolveSongs(trackIds: List<String>): List<Song> {
+        var matched = resolve(trackIds)
         // Only wait for indexing on ids that actually have a received file record; the PC may
-        // commit with the full playlist while only the missing files were pushed, and waiting
-        // for ids that were never sent would stall the request for the entire poll budget.
-        val waiting =
-            ordered.mapIndexed { idx, id -> matched[idx] == null && store.findFileRecord(id) != null }
-        if (waiting.any { it }) {
+        // reference songs that never were pushed, and waiting for those would stall the
+        // request for the entire poll budget.
+        fun stillWaiting() =
+            trackIds.mapIndexed { idx, id -> matched[idx] == null && store.findFileRecord(id) != null }
+        if (stillWaiting().any { it }) {
             // Freshly received files are not indexed yet; force a full re-index and poll the
             // library until the missing songs show up.
             repository.requestIndex(false)
             var polls = 0
-            fun stillWaiting() =
-                ordered.mapIndexed { idx, id ->
-                    matched[idx] == null && store.findFileRecord(id) != null
-                }
             while (stillWaiting().any { it } && polls < COMMIT_POLLS) {
                 delay(COMMIT_POLL_INTERVAL_MS)
-                matched = resolve(ordered)
+                matched = resolve(trackIds)
                 polls++
             }
         }
         val resolved = matched.filterNotNull()
-        if (ordered.isNotEmpty() && resolved.isEmpty()) {
-            throw SyncServer.SyncException(
-                NanoHTTPD.Response.Status.CONFLICT, "tracks_not_indexed")
-        }
-        if (resolved.size < ordered.size) {
-            L.w("Commit skipped ${ordered.size - resolved.size} unresolved track ids")
+        if (resolved.size < trackIds.size) {
+            L.w("Import skipped ${trackIds.size - resolved.size} unresolved track ids")
         }
         return resolved
     }
@@ -408,10 +592,10 @@ constructor(@ApplicationContext private val context: Context, private val reposi
 
     /**
      * Wait for the music library to become available. If no indexing has been kicked off yet
-     * (e.g. an empty playlist was committed), start one. Returns null if the library did not
+     * (e.g. an empty snapshot was applied), start one. Returns null if the library did not
      * load within the polling budget.
      */
-    private suspend fun awaitLibrary(): org.oxycblt.musikr.Library? {
+    private suspend fun awaitLibrary(): Library? {
         if (repository.library == null) {
             if (repository.indexingState == null) {
                 repository.requestIndex(true)
@@ -433,12 +617,11 @@ constructor(@ApplicationContext private val context: Context, private val reposi
         record: SyncStore.FileRecord?,
         name: String,
         mime: String,
-        playlistName: String,
         contentLength: Long,
         input: InputStream,
     ): Pair<String, String> {
         val resolver = context.contentResolver
-        val directory = "$SYNC_DIR_BASE/${sanitizeName(playlistName)}"
+        val directory = SYNC_DIR_BASE
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             if (record != null) {
                 // Fast path: overwrite the file previously received for this ID.
@@ -578,7 +761,9 @@ constructor(@ApplicationContext private val context: Context, private val reposi
         /** The mDNS service type MusicBox browses for, as defined by the sync protocol. */
         const val SERVICE_TYPE = "_musicbox-sync._tcp"
         /** The protocol version this implementation speaks. */
-        const val PROTOCOL = 1
+        const val PROTOCOL = PlaylistSnapshot.PROTOCOL
+        /** Prefix used for file IDs of songs that originate on this device. */
+        const val LOCAL_FILE_ID_PREFIX = "local:"
         /** The read timeout for sync connections, generous to accommodate large files. */
         const val SOCKET_TIMEOUT_MS = 30_000
         /**
